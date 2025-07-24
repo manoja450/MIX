@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <ctime>
 #include <TGraph.h>
+#include <TGraphErrors.h>
 
 using std::cout;
 using std::endl;
@@ -38,7 +39,7 @@ const double MUON_ENERGY_THRESHOLD = 50; // Min PMT energy for muon (p.e.)
 const double MICHEL_ENERGY_MIN = 40;    // Min PMT energy for Michel (p.e.)
 const double MICHEL_ENERGY_MAX = 1000;  // Max PMT energy for Michel (p.e.)
 const double MICHEL_ENERGY_MAX_DT = 400; // Max PMT energy for dt plots (p.e.)
-const double MICHEL_DT_MIN = 0.76;      // Min time after muon for Michel (µs)
+const double MICHEL_DT_MIN = 0.76;       // Min time after muon for Michel (µs)
 const double MICHEL_DT_MAX = 16.0;      // Max time after muon for Michel (µs)
 const int ADCSIZE = 45;                 // Number of ADC samples per waveform
 
@@ -92,15 +93,10 @@ Double_t SPEfit(Double_t *x, Double_t *par) {
     return term1 + term2 + term3 + term4;
 }
 
-// Single exponential fit function: N0 * exp(-t/tau) + C
-Double_t ExpFit(Double_t *x, Double_t *par) {
-    return par[0] * exp(-x[0] / par[1]) ;
-}
-
-// Double exponential fit function with fixed tau_accidental
-Double_t FIXED_TAU_ACCIDENTAL = 1.0; // Placeholder, will be set after fitting accidental dt
+// Double exponential fit function with fixed accidental background
+double tau_accidental = 0.0; // Global accidental lifetime
 Double_t ConstrainedDoubleExpFit(Double_t *x, Double_t *par) {
-    return par[0] * exp(-x[0]/par[1]) + par[2] * exp(-x[0]/FIXED_TAU_ACCIDENTAL);
+    return par[0] * exp(-x[0]/par[1]) + par[2] * exp(-x[0]/tau_accidental);
 }
 
 // Utility functions
@@ -292,7 +288,6 @@ int main(int argc, char *argv[]) {
     // Statistics counters
     int num_muons = 0;
     int num_michels = 0;
-    int num_accidentals = 0;
     int num_events = 0;
 
     // Map to track triggerBits counts
@@ -301,13 +296,16 @@ int main(int argc, char *argv[]) {
     // Define histograms
     TH1D* h_muon_energy = new TH1D("muon_energy", "Muon Energy Distribution (with Michel Electrons);Energy (p.e.);Counts/100 p.e.", 550, -500, 5000);
     TH1D* h_michel_energy = new TH1D("michel_energy", "Michel Electron Energy Distribution;Energy (p.e.);Counts/8 p.e.", 100, 0, 800);
-    TH1D* h_dt_michel = new TH1D("DeltaT", "Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.08 #mus", 200, 0, MICHEL_DT_MAX);
+    TH1D* h_dt_michel = new TH1D("DeltaT", "Muon-Michel Time Difference ;Time to Previous event(Muon)(#mus);Counts/0.08 #mus", 200, 0, MICHEL_DT_MAX);
     TH2D* h_energy_vs_dt = new TH2D("energy_vs_dt", "Michel Energy vs Time Difference;dt (#mus);Energy (p.e.)", 160, 0, 16, 200, 0, 1000);
     TH1D* h_side_vp_muon = new TH1D("side_vp_muon", "Side Veto Energy for Muons;Energy (ADC);Counts", 200, 0, 5000);
     TH1D* h_top_vp_muon = new TH1D("top_vp_muon", "Top Veto Energy for Muons;Energy (ADC);Counts", 200, 0, 1000);
     TH1D* h_trigger_bits = new TH1D("trigger_bits", "Trigger Bits Distribution;Trigger Bits;Counts", 36, 0, 36);
-    TH1D* h_dt_accidental = new TH1D("dt_accidental", "Accidental Events Time Difference;Time to Previous event(#mus);Counts/0.08 #mus", 200, 0, MICHEL_DT_MAX);
-    TH1D* h_accidental_energy = new TH1D("accidental_energy", "Accidental Events Energy Distribution;Energy (p.e.);Counts/8 p.e.", 100, 0, 800);
+    
+    // New histograms for accidental events
+    TH1D* h_dt_accidental = new TH1D("dt_accidental", "Accidental Events Time Difference;dt (#mus);Counts", 200, 0, MICHEL_DT_MAX);
+    TH1D* h_accidental_energy = new TH1D("accidental_energy", "Accidental Events Energy Distribution;Energy (p.e.);Counts", 100, 0, 800);
+    std::vector<double> accidental_times;
 
     for (const auto& inputFileName : inputFiles) {
         // Check if input file exists
@@ -317,6 +315,11 @@ int main(int argc, char *argv[]) {
         }
 
         TFile *f = new TFile(inputFileName.c_str());
+        if (!f || f->IsZombie()) {
+            cout << "Could not open file: " << inputFileName << endl;
+            continue;
+        }
+
         cout << "Processing file: " << inputFileName << endl;
 
         TTree* t = (TTree*)f->Get("tree");
@@ -353,11 +356,11 @@ int main(int argc, char *argv[]) {
         int numEntries = t->GetEntries();
         cout << "Processing " << numEntries << " entries in " << inputFileName << endl;
         double last_muon_time = 0.0;
-        double last_event_time = 0.0;
+        double last_accidental_time = 0.0; // Track previous accidental candidate time
         std::set<double> michel_muon_times;
         std::vector<std::pair<double, double>> muon_candidates;
 
-        // First pass: Identify Michel electrons, muons, and accidental events
+        // First pass: Identify Michel electrons and their muon times
         for (int iEnt = 0; iEnt < numEntries; iEnt++) {
             t->GetEntry(iEnt);
             num_events++;
@@ -534,20 +537,17 @@ int main(int argc, char *argv[]) {
                 veto_low = false;
             }
 
-            // Define common Michel electron and accidental criteria (excluding dt and muon requirement)
-            bool is_michel_or_accidental = p.energy >= MICHEL_ENERGY_MIN &&
-                                          p.energy <= MICHEL_ENERGY_MAX &&
-                                          p.number >= 8 &&
-                                          veto_low &&
-                                          p.trigger != 1 &&
-                                          p.trigger != 4 &&
-                                          p.trigger != 8 &&
-                                          p.trigger != 16;
-
-            // Michel electron criteria (includes dt and muon requirement)
-            bool is_michel_candidate = is_michel_or_accidental &&
+            // Define common Michel electron criteria
+            bool is_michel_candidate = p.energy >= MICHEL_ENERGY_MIN &&
+                                      p.energy <= MICHEL_ENERGY_MAX &&
                                       dt >= MICHEL_DT_MIN &&
-                                      dt <= MICHEL_DT_MAX;
+                                      dt <= MICHEL_DT_MAX &&
+                                      p.number >= 8 &&
+                                      veto_low &&
+                                      p.trigger != 1 &&
+                                      p.trigger != 4 &&
+                                      p.trigger != 8 &&
+                                      p.trigger != 16;
             h_energy_vs_dt->Fill(dt, p.energy);
 
             // Apply additional cut for dt and energy_vs_dt plots
@@ -557,28 +557,37 @@ int main(int argc, char *argv[]) {
                 p.is_michel = true;
                 num_michels++;
                 michel_muon_times.insert(last_muon_time);
+                // Fill Michel energy histogram with original criteria
                 h_michel_energy->Fill(p.energy);
             }
 
             if (is_michel_for_dt) {
+                // Fill dt and energy_vs_dt histograms with stricter energy cut
                 h_dt_michel->Fill(dt);
             }
-
-            // Accidental events: meet Michel criteria (except dt and muon), within time window
-            double dt_acc = p.start - last_event_time; // Time since last event
-            bool is_accidental = is_michel_or_accidental &&
-                                !p.is_michel && // Not a Michel electron
-                                dt_acc >= MICHEL_DT_MIN &&
-                                dt_acc <= MICHEL_DT_MAX;
-
-            if (is_accidental) {
-                num_accidentals++;
-                h_dt_accidental->Fill(dt_acc);
-                h_accidental_energy->Fill(p.energy);
+            
+            // Collect accidental events (beam off, Michel selection without dt cut for collection)
+            if (!p.beam) {  // Beam off
+                // Apply Michel selection without dt cut for time collection
+                if (p.energy >= MICHEL_ENERGY_MIN && p.energy <= MICHEL_ENERGY_MAX && 
+                    p.number >= 8 && veto_low && 
+                    p.trigger != 1 && p.trigger != 4 && p.trigger != 8 && p.trigger != 16) {
+                    
+                    // Calculate dt for accidental event
+                    double acc_dt = p.start - last_accidental_time;
+                    
+                    // Fill accidental energy spectrum if dt is within 1.0–16.0 µs
+                    if (acc_dt >= MICHEL_DT_MIN && acc_dt <= MICHEL_DT_MAX) {
+                        h_accidental_energy->Fill(p.energy);
+                    }
+                    
+                    // Store time for dt calculation
+                    accidental_times.push_back(p.start);
+                    last_accidental_time = p.start; // Update last accidental time
+                }
             }
 
             p.last_muon_time = last_muon_time;
-            last_event_time = p.start; // Update last event time for accidental dt
         }
 
         // Second pass: Fill h_muon_energy for muons associated with Michel electrons
@@ -593,15 +602,28 @@ int main(int argc, char *argv[]) {
         cout << "Total Events: " << num_events << "\n";
         cout << "Muons Detected: " << num_muons << "\n";
         cout << "Michel Electrons Detected: " << num_michels << "\n";
-        cout << "Accidental Events Detected: " << num_accidentals << "\n";
         cout << "------------------------\n";
 
         f->Close();
+        delete f;
 
         num_events = 0;
         num_muons = 0;
         num_michels = 0;
-        num_accidentals = 0;
+    }
+
+    // Calculate time differences for accidental events (within 1.0–16.0 µs)
+    if (!accidental_times.empty()) {
+        // Sort times chronologically
+        std::sort(accidental_times.begin(), accidental_times.end());
+        
+        // Calculate consecutive time differences
+        for (size_t i = 1; i < accidental_times.size(); i++) {
+            double dt = accidental_times[i] - accidental_times[i-1];
+            if (dt >= MICHEL_DT_MIN && dt <= MICHEL_DT_MAX) {
+                h_dt_accidental->Fill(dt);
+            }
+        }
     }
 
     // Print triggerBits distribution
@@ -611,100 +633,17 @@ int main(int argc, char *argv[]) {
     }
     cout << "------------------------\n";
 
-    // Fit accidental dt distribution to extract tau_accidental
+    // Generate analysis plots
     TCanvas *c = new TCanvas("c", "Analysis Plots", 1200, 800);
     gStyle->SetOptStat(1111);
     gStyle->SetOptFit(1111);
-
-    if (h_dt_accidental->GetEntries() > 5) {
-        h_dt_accidental->SetLineWidth(2);
-        h_dt_accidental->SetLineColor(kBlack);
-        h_dt_accidental->GetXaxis()->SetTitle("Time to Previous Event (#mus)");
-        h_dt_accidental->Draw("HIST");
-
-        // Initial parameter estimates for accidental fit
-        double integral = h_dt_accidental->Integral(h_dt_accidental->FindBin(FIT_MIN), h_dt_accidental->FindBin(FIT_MAX));
-        double bin_width = h_dt_accidental->GetBinWidth(1);
-        double N0_init = integral * bin_width / (FIT_MAX - FIT_MIN);
-        double C_init = 0;
-
-        // Estimate constant background from last bins (12-16 µs)
-        int bin_12 = h_dt_accidental->FindBin(12.0);
-        int bin_16 = h_dt_accidental->FindBin(16.0);
-        double min_content = 1e9;
-        for (int i = bin_12; i <= bin_16; i++) {
-            double content = h_dt_accidental->GetBinContent(i);
-            if (content > 0 && content < min_content) min_content = content;
-        }
-        if (min_content < 1e9) C_init = min_content;
-        else C_init = 0.1;
-
-        TF1* expFitAcc = new TF1("expFitAcc", ExpFit, FIT_MIN, FIT_MAX, 3);
-        expFitAcc->SetParameters(N0_init, 2.2, C_init);
-        expFitAcc->SetParLimits(0, 0, N0_init * 100);
-        expFitAcc->SetParLimits(1, 0.1, 20.0);
-        expFitAcc->SetParLimits(2, -C_init * 10, C_init * 10);
-        expFitAcc->SetParNames("N_{0}", "#tau_{acc}", "C");
-        expFitAcc->SetLineColor(kRed);
-        expFitAcc->SetLineWidth(3);
-
-        int fitStatus = h_dt_accidental->Fit(expFitAcc, "RE+", "SAME", FIT_MIN, FIT_MAX);
-        expFitAcc->Draw("SAME");
-
-        gPad->Update();
-        TPaveStats *stats = (TPaveStats*)h_dt_accidental->FindObject("stats");
-        if (stats) {
-            stats->SetX1NDC(0.6);
-            stats->SetX2NDC(0.9);
-            stats->SetY1NDC(0.6);
-            stats->SetY2NDC(0.9);
-            stats->SetTextColor(kRed);
-            stats->Clear();
-            stats->AddText("Accidental dt");
-            stats->AddText(Form("#tau_{acc} = %.4f #pm %.4f #mus", expFitAcc->GetParameter(1), expFitAcc->GetParError(1)));
-            stats->AddText(Form("#chi^{2}/NDF = %.4f", expFitAcc->GetChisquare() / expFitAcc->GetNDF()));
-            stats->AddText(Form("N_{0} = %.1f #pm %.1f", expFitAcc->GetParameter(0), expFitAcc->GetParError(0)));
-            stats->AddText(Form("C = %.1f #pm %.1f", expFitAcc->GetParameter(2), expFitAcc->GetParError(2)));
-            stats->Draw();
-        }
-
-        // Extract tau_accidental
-        FIXED_TAU_ACCIDENTAL = expFitAcc->GetParameter(1);
-        double tau_acc_err = expFitAcc->GetParError(1);
-        cout << "Accidental dt Fit Results (" << FIT_MIN << "-" << FIT_MAX << " µs):\n";
-        cout << "Fit Status: " << fitStatus << " (0 = success)\n";
-        cout << Form("τ_acc = %.4f ± %.4f µs", FIXED_TAU_ACCIDENTAL, tau_acc_err) << endl;
-        cout << Form("N₀ = %.1f ± %.1f", expFitAcc->GetParameter(0), expFitAcc->GetParError(0)) << endl;
-        cout << Form("C = %.1f ± %.1f", expFitAcc->GetParameter(2), expFitAcc->GetParError(2)) << endl;
-        cout << Form("χ²/NDF = %.4f", expFitAcc->GetChisquare() / expFitAcc->GetNDF()) << endl;
-        cout << "----------------------------------------" << endl;
-
-        string plotName = OUTPUT_DIR + "/Accidental_dt.png";
-        c->SaveAs(plotName.c_str());
-        cout << "Saved plot: " << plotName << endl;
-
-        delete expFitAcc;
-    } else {
-        cout << "Warning: h_dt_accidental has insufficient entries (" << h_dt_accidental->GetEntries() 
-             << "), skipping exponential fit" << endl;
-    }
-
-    // Generate analysis plots
-    // Accidental Energy
-    c->Clear();
-    h_accidental_energy->SetLineColor(kBlue);
-    h_accidental_energy->Draw();
-    c->Update();
-    string plotName = OUTPUT_DIR + "/Accidental_Energy.png";
-    c->SaveAs(plotName.c_str());
-    cout << "Saved plot: " << plotName << endl;
 
     // Muon Energy
     c->Clear();
     h_muon_energy->SetLineColor(kBlue);
     h_muon_energy->Draw();
     c->Update();
-    plotName = OUTPUT_DIR + "/Muon_Energy.png";
+    string plotName = OUTPUT_DIR + "/Muon_Energy.png";
     c->SaveAs(plotName.c_str());
     cout << "Saved plot: " << plotName << endl;
 
@@ -717,44 +656,83 @@ int main(int argc, char *argv[]) {
     c->SaveAs(plotName.c_str());
     cout << "Saved plot: " << plotName << endl;
 
+    // Accidental Energy Spectrum
+    c->Clear();
+    h_accidental_energy->SetLineColor(kGreen);
+    h_accidental_energy->SetLineWidth(2);
+    h_accidental_energy->Draw();
+    c->Update();
+    plotName = OUTPUT_DIR + "/Accidental_Energy.png";
+    c->SaveAs(plotName.c_str());
+    cout << "Saved plot: " << plotName << endl;
+
+    // Accidental dt distribution and fit
+    c->Clear();
+    h_dt_accidental->SetLineWidth(2);
+    h_dt_accidental->SetLineColor(kBlue);
+    h_dt_accidental->GetXaxis()->SetTitle("Time Difference (#mus)");
+    h_dt_accidental->GetYaxis()->SetTitle("Counts");
+    h_dt_accidental->Draw("HIST");
+    
+    // Fit accidental dt with single exponential
+    TF1* fAcc = nullptr;
+    if (h_dt_accidental->GetEntries() > 10) {
+        fAcc = new TF1("fAcc", "[0]*exp(-x/[1])", MICHEL_DT_MIN, MICHEL_DT_MAX);
+        fAcc->SetParameters(h_dt_accidental->GetMaximum(), 10.0); // Initial guess
+        fAcc->SetParNames("N", "#tau_{acc}");
+        fAcc->SetLineColor(kRed);
+        fAcc->SetLineWidth(2);
+        
+        h_dt_accidental->Fit(fAcc, "R");
+        fAcc->Draw("SAME"); // Ensure fit line is drawn
+        tau_accidental = fAcc->GetParameter(1); // Store accidental lifetime
+        
+        cout << "Accidental Lifetime Fit Results:\n";
+        cout << "τ_acc = " << fAcc->GetParameter(1) << " ± " << fAcc->GetParError(1) << " µs\n";
+        cout << "χ²/NDF = " << fAcc->GetChisquare() / fAcc->GetNDF() << endl;
+        cout << "----------------------------------------" << endl;
+    } else {
+        cerr << "Warning: Insufficient accidental events for fit (" 
+             << h_dt_accidental->GetEntries() << " events)" << endl;
+        tau_accidental = 1.0; // Default value
+    }
+    
+    c->Update();
+    plotName = OUTPUT_DIR + "/Accidental_dt.png";
+    c->SaveAs(plotName.c_str());
+    cout << "Saved plot: " << plotName << endl;
+    if (fAcc) delete fAcc;
+    
     // Michel dt with double exponential fit
     c->Clear();
     h_dt_michel->SetLineWidth(2);
     h_dt_michel->SetLineColor(kBlack);
-    h_dt_michel->GetXaxis()->SetTitle("Time to Previous Event (Muon) [#mus]");
+    h_dt_michel->GetXaxis()->SetTitle("Time to previous event (Muon) [#mus]");
     h_dt_michel->Draw("HIST");
 
     TF1* doubleExpFit = nullptr;
-    if (h_dt_michel->GetEntries() > 5 && FIXED_TAU_ACCIDENTAL > 0) {
-        // Initial parameter estimates
-        double integral = h_dt_michel->Integral(h_dt_michel->FindBin(FIT_MIN), h_dt_michel->FindBin(FIT_MAX));
-        double bin_width = h_dt_michel->GetBinWidth(1);
-        double N0_init = integral * bin_width / (FIT_MAX - FIT_MIN) / 2;
-        double C_init = 0;
-
-        // Estimate constant background from last bins (12-16 µs)
-        int bin_12 = h_dt_michel->FindBin(12.0);
-        int bin_16 = h_dt_michel->FindBin(16.0);
-        double min_content = 1e9;
-        for (int i = bin_12; i <= bin_16; i++) {
-            double content = h_dt_michel->GetBinContent(i);
-            if (content > 0 && content < min_content) min_content = content;
-        }
-        if (min_content < 1e9) C_init = min_content;
-        else C_init = 0.1;
-
+    if (h_dt_michel->GetEntries() > 5) {
+        // Create double exponential function with fixed accidental component
         doubleExpFit = new TF1("doubleExpFit", ConstrainedDoubleExpFit, FIT_MIN, FIT_MAX, 3);
-        doubleExpFit->SetParameters(N0_init, 2.2, C_init);
-        doubleExpFit->SetParLimits(0, 0, N0_init * 100);
+        doubleExpFit->SetParNames("N_{#mu}", "#tau_{#mu}", "N_{acc}");
+        
+        // Set initial parameters
+        double muon_lifetime_guess = 2.2;
+        double N0_guess = h_dt_michel->GetBinContent(h_dt_michel->FindBin(FIT_MIN)) * 1.2;
+        double N_acc_guess = h_dt_michel->GetBinContent(h_dt_michel->FindBin(FIT_MAX)) * 0.8;
+        
+        doubleExpFit->SetParameters(N0_guess, muon_lifetime_guess, N_acc_guess);
+        doubleExpFit->SetParLimits(0, 0, N0_guess * 10);
         doubleExpFit->SetParLimits(1, 0.1, 20.0);
-        doubleExpFit->SetParLimits(2, 0, C_init * 100);
-        doubleExpFit->SetParNames("N_{0}", "#tau_{muon}", "N_{acc}");
+        doubleExpFit->SetParLimits(2, 0, N_acc_guess * 10);
         doubleExpFit->SetLineColor(kRed);
         doubleExpFit->SetLineWidth(3);
-
+        
+        // Perform fit
         int fitStatus = h_dt_michel->Fit(doubleExpFit, "RE+", "SAME", FIT_MIN, FIT_MAX);
-        doubleExpFit->Draw("SAME");
-
+        doubleExpFit->Draw("SAME"); // Ensure fit line is drawn
+        
+        // Update stats box
         gPad->Update();
         TPaveStats *stats = (TPaveStats*)h_dt_michel->FindObject("stats");
         if (stats) {
@@ -764,19 +742,24 @@ int main(int argc, char *argv[]) {
             stats->SetY2NDC(0.9);
             stats->SetTextColor(kRed);
             stats->Clear();
-            stats->AddText("Michel dt (Double Exp)");
-            stats->AddText(Form("#tau_{muon} = %.4f #pm %.4f #mus", doubleExpFit->GetParameter(1), doubleExpFit->GetParError(1)));
-            stats->AddText(Form("#tau_{acc} = %.4f (fixed)", FIXED_TAU_ACCIDENTAL));
-            stats->AddText(Form("#chi^{2}/NDF = %.4f", doubleExpFit->GetChisquare() / doubleExpFit->GetNDF()));
-            stats->AddText(Form("N_{0} = %.1f #pm %.1f", doubleExpFit->GetParameter(0), doubleExpFit->GetParError(0)));
-            stats->AddText(Form("N_{acc} = %.1f #pm %.1f", doubleExpFit->GetParameter(2), doubleExpFit->GetParError(2)));
+            stats->AddText("Double Exponential Fit");
+            stats->AddText(Form("#tau_{#mu} = %.4f #pm %.4f #mus", 
+                                doubleExpFit->GetParameter(1), doubleExpFit->GetParError(1)));
+            stats->AddText(Form("#chi^{2}/NDF = %.4f", 
+                                doubleExpFit->GetChisquare() / doubleExpFit->GetNDF()));
+            stats->AddText(Form("N_{#mu} = %.1f #pm %.1f", 
+                                doubleExpFit->GetParameter(0), doubleExpFit->GetParError(0)));
+            stats->AddText(Form("N_{acc} = %.1f #pm %.1f", 
+                                doubleExpFit->GetParameter(2), doubleExpFit->GetParError(2)));
+            stats->AddText(Form("#tau_{acc} fixed = %.4f #mus", tau_accidental));
             stats->Draw();
         }
-
-        double N0 = doubleExpFit->GetParameter(0);
-        double N0_err = doubleExpFit->GetParError(0);
-        double tau_muon = doubleExpFit->GetParameter(1);
-        double tau_muon_err = doubleExpFit->GetParError(1);
+        
+        // Print fit results
+        double N_mu = doubleExpFit->GetParameter(0);
+        double N_mu_err = doubleExpFit->GetParError(0);
+        double tau_mu = doubleExpFit->GetParameter(1);
+        double tau_mu_err = doubleExpFit->GetParError(1);
         double N_acc = doubleExpFit->GetParameter(2);
         double N_acc_err = doubleExpFit->GetParError(2);
         double chi2 = doubleExpFit->GetChisquare();
@@ -785,72 +768,57 @@ int main(int argc, char *argv[]) {
 
         cout << "Double Exponential Fit Results (Michel dt, " << FIT_MIN << "-" << FIT_MAX << " µs):\n";
         cout << "Fit Status: " << fitStatus << " (0 = success)\n";
-        cout << Form("τ_muon = %.4f ± %.4f µs", tau_muon, tau_muon_err) << endl;
-        cout << Form("τ_acc = %.4f µs (fixed)", FIXED_TAU_ACCIDENTAL) << endl;
-        cout << Form("N₀ = %.1f ± %.1f", N0, N0_err) << endl;
+        cout << Form("τ_μ = %.4f ± %.4f µs", tau_mu, tau_mu_err) << endl;
+        cout << Form("N_μ = %.1f ± %.1f", N_mu, N_mu_err) << endl;
         cout << Form("N_acc = %.1f ± %.1f", N_acc, N_acc_err) << endl;
+        cout << Form("τ_acc (fixed) = %.4f µs", tau_accidental) << endl;
         cout << Form("χ²/NDF = %.4f", chi2_ndf) << endl;
         cout << "----------------------------------------" << endl;
     } else {
         cout << "Warning: h_dt_michel has insufficient entries (" << h_dt_michel->GetEntries() 
-             << ") or tau_accidental invalid, skipping double exponential fit" << endl;
+             << "), skipping double exponential fit" << endl;
     }
-
+    
     c->Update();
-    c->Modified();
-    c->RedrawAxis();
-    plotName = OUTPUT_DIR + "/Michel_dt_DoubleExp.png";
+    plotName = OUTPUT_DIR + "/Michel_dt.png";
     c->SaveAs(plotName.c_str());
     cout << "Saved plot: " << plotName << endl;
 
-    if (doubleExpFit) {
-        delete doubleExpFit;
-        doubleExpFit = nullptr;
-    }
-
-    // Compare different exponential fit start times (single exponential, as in original code)
-    if (h_dt_michel->GetEntries() > 5) {
-        h_dt_michel->GetListOfFunctions()->Clear();
-        
+    // Compare different exponential fit start times for double exponential
+    if (h_dt_michel->GetEntries() > 5 && doubleExpFit != nullptr) {
+        // Define fit start times (1.0 to 4.0 μs in 0.5 μs steps)
         std::vector<double> fit_starts = {1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0};
         std::vector<double> taus, tau_errs, chi2ndfs;
         int best_index = -1;
         double min_chi2ndf = 1e9;
         
+        // Perform fits for each start time
         for (int i = 0; i < fit_starts.size(); i++) {
             double fit_start = fit_starts[i];
             double fit_end = 16.0;
             
-            TF1* expFit_var = new TF1(Form("expFit_var_%.1f", fit_start), ExpFit, fit_start, fit_end, 3);
+            TF1* doubleExpFit_var = new TF1(Form("doubleExpFit_var_%.1f", fit_start), ConstrainedDoubleExpFit, fit_start, fit_end, 3);
+            doubleExpFit_var->SetParNames("N_{#mu}", "#tau_{#mu}", "N_{acc}");
             
-            double C_init = 0;
-            int bin_12 = h_dt_michel->FindBin(12.0);
-            int bin_16 = h_dt_michel->FindBin(16.0);
-            double min_content = 1e9;
-            for (int bin = bin_12; bin <= bin_16; bin++) {
-                double content = h_dt_michel->GetBinContent(bin);
-                if (content > 0 && content < min_content) min_content = content;
-            }
-            if (min_content < 1e9) C_init = min_content;
-            else C_init = 0.1;
+            // Use parameters from main fit as initial values
+            double N0_init = doubleExpFit->GetParameter(0);
+            double tau_mu_init = doubleExpFit->GetParameter(1);
+            double N_acc_init = doubleExpFit->GetParameter(2);
             
-            double integral = h_dt_michel->Integral(h_dt_michel->FindBin(fit_start), h_dt_michel->FindBin(fit_end));
-            double bin_width = h_dt_michel->GetBinWidth(1);
-            double N0_init = (integral * bin_width - C_init * (fit_end - fit_start)) / 2.2;
-            if (N0_init < 0) N0_init = 100;
+            doubleExpFit_var->SetParameters(N0_init, tau_mu_init, N_acc_init);
+            doubleExpFit_var->SetParLimits(0, 0, N0_init * 10);
+            doubleExpFit_var->SetParLimits(1, 0.1, 20.0);
+            doubleExpFit_var->SetParLimits(2, 0, N_acc_init * 10);
+            doubleExpFit_var->SetLineColor(i+1);
             
-            expFit_var->SetParameters(N0_init, 2.2, C_init);
-            expFit_var->SetParNames("N_{0}", "#tau", "C");
-            expFit_var->SetParLimits(0, 0, N0_init * 100);
-            expFit_var->SetParLimits(1, 0.1, 20.0);
-            expFit_var->SetParLimits(2, -C_init * 10, C_init * 10);
+            // Perform fit (quietly)
+            int fitStatus = h_dt_michel->Fit(doubleExpFit_var, "QRN+", "", fit_start, fit_end);
             
-            int fitStatus = h_dt_michel->Fit(expFit_var, "QRN+", "", fit_start, fit_end);
-            
-            double tau = expFit_var->GetParameter(1);
-            double tau_err = expFit_var->GetParError(1);
-            double chi2 = expFit_var->GetChisquare();
-            int ndf = expFit_var->GetNDF();
+            // Record results
+            double tau = doubleExpFit_var->GetParameter(1);
+            double tau_err = doubleExpFit_var->GetParError(1);
+            double chi2 = doubleExpFit_var->GetChisquare();
+            int ndf = doubleExpFit_var->GetNDF();
             double chi2ndf = (ndf > 0) ? chi2 / ndf : 999;
             
             taus.push_back(tau);
@@ -862,33 +830,39 @@ int main(int argc, char *argv[]) {
                 best_index = i;
             }
             
-            cout << Form("Single Exp Fit Range %.1f–%.1f µs:\n", fit_start, fit_end);
+            // Print fit results for this range
+            cout << Form("Double Exp Fit Range %.1f–%.1f µs:\n", fit_start, fit_end);
             cout << "Fit Status: " << fitStatus << " (0 = success)\n";
-            cout << Form("τ = %.4f ± %.4f µs", tau, tau_err) << endl;
+            cout << Form("τ_μ = %.4f ± %.4f µs", tau, tau_err) << endl;
             cout << Form("χ²/NDF = %.4f", chi2ndf) << endl;
             cout << "----------------------------------------" << endl;
             
-            delete expFit_var;
+            delete doubleExpFit_var;
         }
         
+        // Print best fit result
         if (best_index >= 0) {
-            cout << Form("Best Single Exp Fit Range: %.1f–16.0 µs\n", fit_starts[best_index]);
-            cout << Form("τ = %.4f ± %.4f µs", taus[best_index], tau_errs[best_index]) << endl;
+            cout << Form("Best Double Exp Fit Range: %.1f–16.0 µs\n", fit_starts[best_index]);
+            cout << Form("τ_μ = %.4f ± %.4f µs", taus[best_index], tau_errs[best_index]) << endl;
             cout << Form("χ²/NDF = %.4f (minimum)", chi2ndfs[best_index]) << endl;
             cout << "----------------------------------------" << endl;
         }
         
-        TCanvas* c_comp = new TCanvas("c_comp", "Single Exp Fit Start Time Comparison", 1200, 800);
+        // Create comparison plot
+        TCanvas* c_comp = new TCanvas("c_comp", "Double Exp Fit Start Time Comparison", 1200, 800);
         c_comp->SetGrid();
         
+        // Create pad for the main plot
         TPad* pad = new TPad("pad", "pad", 0, 0, 1, 1);
         pad->Draw();
         pad->cd();
         
+        // Create graphs
         TGraph* g_chi2 = new TGraph(fit_starts.size(), &fit_starts[0], &chi2ndfs[0]);
         TGraph* g_tau = new TGraph(fit_starts.size(), &fit_starts[0], &taus[0]);
         
-        g_chi2->SetTitle("Single Exp Fit Start Time Comparison");
+        // Configure chi2 graph (left axis)
+        g_chi2->SetTitle("Double Exponential Fit Start Time Comparison");
         g_chi2->GetXaxis()->SetTitle("Fit Start Time (#mus)");
         g_chi2->GetYaxis()->SetTitle("#chi^{2}/ndf");
         g_chi2->SetMarkerStyle(20);
@@ -896,56 +870,67 @@ int main(int argc, char *argv[]) {
         g_chi2->SetLineColor(kBlue);
         g_chi2->SetLineWidth(2);
         
-        g_tau->SetMarkerStyle(22);
+        // Configure tau graph (right axis)
+        g_tau->SetMarkerStyle(20); // Use filled circle to match chi2 style
         g_tau->SetMarkerColor(kRed);
         g_tau->SetLineColor(kRed);
         g_tau->SetLineWidth(2);
         
-        g_chi2->Draw("APL");
+        // Draw chi2 first to establish the frame
+        g_chi2->Draw("ALP");
         
+        // Create right axis
         pad->Update();
         double ymin = pad->GetUymin();
         double ymax = pad->GetUymax();
         
-        double tau_min = *min_element(taus.begin(), taus.end());
-        double tau_max = *max_element(taus.begin(), taus.end());
+        // Scale tau values to match chi2 plot range
+        double tau_min = *min_element(taus.begin(), taus.end()) * 0.9;
+        double tau_max = *max_element(taus.begin(), taus.end()) * 1.1;
         double scale = (ymax - ymin)/(tau_max - tau_min);
         double offset = ymin - tau_min * scale;
         
+        // Scale the tau graph
         for (int i = 0; i < g_tau->GetN(); i++) {
             double x, y;
             g_tau->GetPoint(i, x, y);
             g_tau->SetPoint(i, x, y * scale + offset);
         }
         
-        g_tau->Draw("PL same");
+        // Draw tau graph on same pad (line with markers, no error bars)
+        g_tau->Draw("LP same");
         
+        // Create right axis
         TGaxis* axis = new TGaxis(gPad->GetUxmax(), gPad->GetUymin(),
                                  gPad->GetUxmax(), gPad->GetUymax(),
                                  tau_min, tau_max, 510, "+L");
         axis->SetLineColor(kRed);
         axis->SetLabelColor(kRed);
-        axis->SetTitle("#tau (#mus)");
+        axis->SetTitle("#tau_{#mu} (#mus)");
         axis->SetTitleColor(kRed);
         axis->Draw();
         
+        // Add legend
         TLegend* leg = new TLegend(0.7, 0.7, 0.9, 0.9);
         leg->AddEntry(g_chi2, "#chi^{2}/ndf", "lp");
-        leg->AddEntry(g_tau, "#tau", "lp");
+        leg->AddEntry(g_tau, "#tau_{#mu}", "lp");
         leg->Draw();
         
-        string compPlotName = OUTPUT_DIR + "/SingleExpFitStartComparison.png";
+        // Save plot
+        string compPlotName = OUTPUT_DIR + "/DoubleExpFitStartComparison.png";
         c_comp->SaveAs(compPlotName.c_str());
         cout << "Saved comparison plot: " << compPlotName << endl;
         
+        // Clean up
         delete g_chi2;
         delete g_tau;
         delete leg;
         delete axis;
         delete pad;
         delete c_comp;
-    } else {
-        cout << "Skipping single exp fit start comparison - insufficient entries in dt histogram" << endl;
+    }
+    else {
+        cout << "Skipping double exponential fit start comparison - insufficient entries in dt histogram" << endl;
     }
 
     // Energy vs dt
@@ -995,6 +980,7 @@ int main(int argc, char *argv[]) {
     delete h_trigger_bits;
     delete h_dt_accidental;
     delete h_accidental_energy;
+    if (doubleExpFit) delete doubleExpFit;
     delete c;
 
     cout << "Analysis complete. Results saved in " << OUTPUT_DIR << "/ (*.png)" << endl;
