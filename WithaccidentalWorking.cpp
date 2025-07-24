@@ -566,19 +566,24 @@ int main(int argc, char *argv[]) {
                 h_dt_michel->Fill(dt);
             }
             
-            // Collect accidental events (beam off, Michel selection without dt cut for collection, but reject Michel-like events following a muon)
+            // Collect accidental events (beam off, Michel selection without dt cut for collection)
             if (!p.beam) {  // Beam off
-                double dt_muon = p.start - last_muon_time;
+                // Apply Michel selection without dt cut for time collection
                 if (p.energy >= MICHEL_ENERGY_MIN && p.energy <= MICHEL_ENERGY_MAX && 
                     p.number >= 8 && veto_low && 
-                    p.trigger != 1 && p.trigger != 4 && p.trigger != 8 && p.trigger != 16 &&
-                    (dt_muon < MICHEL_DT_MIN || dt_muon > MICHEL_DT_MAX)) { // Reject Michel-like events following a muon
+                    p.trigger != 1 && p.trigger != 4 && p.trigger != 8 && p.trigger != 16) {
+                    
+                    // Calculate dt for accidental event
                     double acc_dt = p.start - last_accidental_time;
+                    
+                    // Fill accidental energy spectrum if dt is within 1.0–16.0 µs
                     if (acc_dt >= MICHEL_DT_MIN && acc_dt <= MICHEL_DT_MAX) {
                         h_accidental_energy->Fill(p.energy);
                     }
+                    
+                    // Store time for dt calculation
                     accidental_times.push_back(p.start);
-                    last_accidental_time = p.start;
+                    last_accidental_time = p.start; // Update last accidental time
                 }
             }
 
